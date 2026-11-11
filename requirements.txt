@@ -1,0 +1,5 @@
+cbsodata
+pandas
+sqlalchemy
+psycopg[binary]
+python-dotenv
