@@ -48,7 +48,7 @@ def fetch_periods(keys, first_run, batch_size=12):
         parts.append(pd.DataFrame(cbsodata.get_data(TABLE_ID, filters=flt)))                # download this batch and add it to the list
     return pd.concat(parts, ignore_index=True)                                              # stack all batches into one DataFrame
 
-## function to store the dimensional / meta data into the postgreSQL database: bronze.dim_
+## function to store the dimensional / meta data into the postgreSQL database: bronze.raw_
 def load_lookups(engine):
     props = pd.DataFrame(cbsodata.get_meta(TABLE_ID, 'DataProperties'))                     # get the list of table properties from CBS
     dims = props.loc[props['Type'].isin(['Dimension', 'TimeDimension']), 'Key'].tolist()    # get the list of names of the dimension tables (Type = Dimension/TimeDimension)
@@ -58,7 +58,8 @@ def load_lookups(engine):
     for name in dims:                                                                       # for each dimension table:
         df = pd.DataFrame(cbsodata.get_meta(TABLE_ID, name))                                # download this dimension's metadata from CBS
         df.columns = df.columns.str.lower()                                                 # adjust meta data columns to start lowercase
-        table = 'dim_' + name.lower()                                                       # table names are lowercase and have prefix dim_
+        df = df.convert_dtypes()                                                            # pick the best nullable type per column (float ids with nulls → Int64)
+        table = 'raw_' + name.lower()                                                       # table names are lowercase and have prefix raw_
         with engine.begin() as conn:                                                        # open a connection + transaction. Everything in this block is committed together at the end, or rolled back on an error
             if table in existing:                                                           # if meta data table already exists in postgreSQL database: 
                 conn.execute(text(f'TRUNCATE bronze.{table}'))                              # empty the existing table, keep its structure

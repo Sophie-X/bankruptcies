@@ -2,7 +2,7 @@
 
 A small data pipeline for Dutch bankruptcy figures from CBS (Statistics Netherlands). It loads the data into PostgreSQL in medallion layers (bronze → silver → gold) and uses an **incremental load**: on each run it fetches only the periods that are new or can still change.
 
-> Status: work in progress (pre-gold). The scripted ingest (`scripts/ingest.py`) loads bronze incrementally and logs each run in `control.load_runs`. The first silver view and the first QA views are in place. The silver redesign (fact + dimensions) and the gold layer are still to do; after that comes the model in Python.
+> Status: work in progress (pre-gold). The scripted ingest (`scripts/ingest.py`) loads bronze incrementally and logs each run in `control.load_runs`. Silver is split into a fact and three dimensions, with the sector level mapping in `control`. The QA views read the new fact. Next: the key-matching and dimension checks in QA, then the gold layer, then the model in Python.
 
 ## Working with AI assistants
 
@@ -16,7 +16,7 @@ This is a learning project: I write the code myself.
 - **Python only fetches and loads. All transformations are in SQL.** Python reads from the CBS OData API and writes raw data to `bronze`. Silver and gold are SQL views/tables.
 - **Incremental, not full refresh.** Final (`Definitief`) figures never change, so they are loaded once and then skipped. Only new or provisional periods are (re)loaded. A control table tracks this.
 - **Join on codes, not on titles.** CBS sometimes rewords titles. Final periods are never reloaded, so they keep the title CBS used at the time they were loaded. A join on titles would then silently drop rows.
-- **Silver is complete; gold is shaped for its use.** Silver keeps all sector levels and only cleans, types and conforms the data. Choices made for a specific analysis (such as which sector level to use) are made in gold.
+- **Silver is complete; gold is shaped for its use.** Silver keeps all sector levels and all period types, and only cleans, types and conforms the data. Choices made for a specific analysis (such as which sector level or period type to use) are made in gold.
 - **No hardcoded IDs for analysis choices.** Choices like the sector level are stored once, as named settings in `control`, not as magic numbers in the SQL.
 
 ## Data source
@@ -60,41 +60,46 @@ No structural rule (such as "groups without a parent") picks out group 2 on its 
 CBS OData API (82244ENG)
         │  Python: cbsodata + pandas + SQLAlchemy
         ▼
-┌──────────────┐   ┌──────────────────────────────┐
-│ control      │   │ bronze                       │
-│ load_periods │   │ raw_bankruptcies  (facts)    │
-│ load_runs    │   │ dim_typeofbankruptcy         │
-└──────────────┘   │                              │
-                   │ dim_sectorbranchessic2008    │
-                   │ dim_periods                  │
-                   │ dim_categorygroups           │
-                   └──────────────────────────────┘
-                              │  SQL
-                              ▼
-                   silver.bankruptcies_monthly (view)  ──►  qa.*  (checks)
-                              │  SQL
-                              ▼
-                   gold  (to do)
+┌───────────────┐   ┌──────────────────────────────┐
+│ control       │   │ bronze                       │
+│ load_periods  │   │ raw_bankruptcies  (facts)    │
+│ load_runs     │   │ raw_typeofbankruptcy         │
+│ sector_levels │   │ raw_sectorbranchessic2008    │
+└───────────────┘   │ raw_periods                  │
+                    │ raw_categorygroups           │
+                    └──────────────────────────────┘
+                               │  SQL
+                               ▼
+                    silver (views)                     ──►  qa.*  (checks)
+                    fact_bankruptcies
+                    dim_periods
+                    dim_sectors  (+ control.sector_levels)
+                    dim_typesofbankruptcies
+                               │  SQL
+                               ▼
+                    gold  (to do)
 ```
 
 ### Schemas
 
 | Schema | Contents |
 |---|---|
-| `control` | Load bookkeeping (`load_periods`, `load_runs`, view `load_run_durations`) and, planned, analysis settings such as the sector-level mapping |
-| `bronze` | Raw data from CBS, column names lower-cased, no other changes |
-| `silver` | Cleaned, typed and conformed views, all sector levels |
-| `gold` | Analysis-ready models, one sector level at a time (to do) |
+| `control` | Load bookkeeping (`load_periods`, `load_runs`, view `load_run_durations`) and analysis settings: the sector-level mapping `sector_levels` |
+| `bronze` | Raw data from CBS: table names `raw_<cbs name in lower case>`, column names lower-cased, column types picked by pandas (see *Lookups*) |
+| `silver` | Cleaned, typed and conformed views (fact + dimensions), all sector levels and period types |
+| `gold` | Analysis-ready models, one sector level and one period type at a time (to do) |
 | `qa` | Data-quality checks on silver |
 
 ## Load logic
 
 ### Lookups: SCD Type 1
 
-The `bronze.dim_*` tables are reloaded in full on every run, without history.
+The lookup tables (`bronze.raw_periods`, `raw_sectorbranchessic2008`, `raw_typeofbankruptcy`, `raw_categorygroups`) are reloaded in full on every run, without history.
 
 - SIC 2008 is a fixed classification: a code always means the same sector. CBS only changes the wording of titles, and no analysis needs the old wording. Type 2 history would add complexity and no value.
 - The load does `TRUNCATE` + append, **not** `to_sql(if_exists='replace')`. `replace` drops the table, and that fails as soon as a silver view depends on it.
+- **Column types:** before writing, `df.convert_dtypes()` gives every column the best nullable type. Without it, pandas turns an integer column with nulls (such as `parentid`) into floats (`2.0`), and Postgres stores it as `double precision`. With it, ids arrive as `bigint` (`int8`). This keeps the type CBS sends; it is not a transformation.
+- **Types are fixed when a table is created.** `TRUNCATE` + append keeps the existing table and its column types, and `to_sql` never changes them. A type change in the ingest therefore only reaches Postgres after a one-time rebuild: drop the dependent silver views, drop the lookup table, run the ingest, recreate the views. (`ALTER COLUMN ... TYPE` is no shortcut: Postgres refuses it for columns that a view uses.) A fresh database gets the right types on the first run.
 
 ### Facts: incremental load with a control table
 
@@ -107,7 +112,7 @@ On each run:
    - **Provisional**: its status at CBS is not `Definitief`.
    - **Status changed**: the status differs from the last load (for example provisional → `Definitief`).
 4. Download the selected periods. On the first run (empty control table), download the full table in one call, which is faster. On later runs, download in batches of 12 periods with an OData filter (`Periods eq '…' or …`).
-5. Map each row's period title to its `period_key` with the `Periods` lookup.
+5. Restore the codes (`add_keys`): map each row's period, sector and type title to its key (`period_key`, `sector_key`, `type_key`) with the lookups from the same run. If any title cannot be mapped, the run stops with an error before anything is written.
 6. In **one transaction**: delete the selected periods from `bronze.raw_bankruptcies` and append the new rows. Then replace their entries in `control.load_periods`, with `loaded_at` set to the current UTC time.
 
 If any step in the transaction fails, neither the facts nor the control table change. This keeps the two in sync.
@@ -120,51 +125,61 @@ The fact table should have at least 335,916 rows. If a download returns signific
 
 ## Silver layer
 
-### `silver.bankruptcies_monthly` (view, current)
+Silver is a small star schema: one fact view and three dimension views. Every view only cleans, types and conforms; nothing is filtered. All sector levels and all period types (months, quarters, years) are kept, so gold can use any of them.
 
-Monthly bankruptcies per type and per sector, **for all sector levels**.
+> ⚠️ **Double counting.** The fact contains every sector level **and** every period type. Each bankruptcy therefore appears once per level and once per period type (month, quarter, year). Never `SUM` over it without filtering to exactly **one** sector level and **one** period type.
+
+### `silver.fact_bankruptcies`
+
+Keys + measure only. Source: `bronze.raw_bankruptcies`.
 
 | Column | Source / logic |
 |---|---|
-| `bankruptcy_type_code` | `dim_typeofbankruptcy.key` (trimmed) |
-| `bankruptcy_type` | `typeofbankruptcy` (title, from the bronze fact table) |
-| `sector_code` | `dim_sectorbranchessic2008.key` (trimmed) |
-| `sector_description` | `dim_sectorbranchessic2008.title` |
-| `period_key` | e.g. `2024MM03` |
-| `period_date` | first day of the month, built from `period_key` |
+| `period_key` | trimmed, e.g. `2024MM03` → `dim_periods.period_key` |
+| `sector_key` | trimmed → `dim_sectors.sector_key` |
+| `type_key` | trimmed → `dim_typesofbankruptcies.type_key` |
+| `bankruptcies` | `pronouncedbankruptcies_1` |
+
+Period type, date and status live in `dim_periods`, so they are derived in one place only.
+
+**Naming:** each key has the same name in the fact and in its dimension (`period_key`, `sector_key`, `type_key`), so joins can use `USING (...)`. The values are CBS's own codes, not surrogate keys; `_key` follows CBS's `Key` column and the ingest (`add_keys`). Dimension attributes take the same prefix (`sector_title`, `type_title`, …).
+
+### `silver.dim_periods`
+
+One row per period. Source: `bronze.raw_periods`, left join `control.load_periods` on the trimmed key.
+
+| Column | Source / logic |
+|---|---|
+| `period_key` | `key`, trimmed |
+| `period_type` | characters 5–6 of the key: `MM` (month), `KW` (quarter), `JJ` (year) |
+| `period_date` | first day of the period: month → that month; quarter → its first month (`quarter × 3 − 2`); year → 1 January |
 | `period_status` | status from `control.load_periods` |
 | `is_provisional` | `period_status <> 'Definitief'`; a period without a status counts as provisional |
-| `bankruptcies` | `pronouncedbankruptcies_1` cast to integer |
 
-Joins (all on codes): inner joins to the type lookup, the sector lookup and `dim_categorygroups`; left join to `control.load_periods`.
+### `silver.dim_sectors`
 
-Filter: only monthly periods (`period_key LIKE '____MM__'`; the fixed length also checks the format). The earlier sector filter (category group `parentid = 2`) has been **removed**: choosing a sector level is a gold decision.
+One row per sector, with its level. Source: `bronze.raw_sectorbranchessic2008`.
 
-> ⚠️ **Double counting.** This view contains every sector level, so each bankruptcy appears once per level. Never `SUM` over it without filtering to exactly **one** level.
+| Column | Source / logic |
+|---|---|
+| `sector_key` | `key`, trimmed |
+| `sector_title` | `title` |
+| `sector_categorygroupid` | `categorygroupid` |
+| `level_group` | root group id from the mapping |
+| `level_description` | root title from the mapping |
+| `level_name` | `sbi_0` … `sbi_3` from the mapping |
 
-Source file: [`sql/silver/bankruptcies_monthly.sql`](sql/silver/bankruptcies_monthly.sql)
+Joins: sector → **LEFT JOIN** `raw_categorygroups` on its group → **LEFT JOIN** `control.sector_levels` on the root group, `COALESCE(parentid, id)`: the parent of the group, or the group itself when it has no parent. Every group that holds sectors has a parent (the total sector's group 1 sits under root 0), so in practice the join uses `parentid`; the fallback only guards against a sector placed directly in a root group. Both joins are left joins, so no sector can drop out; a sector without a level shows up with an empty `level_name` (see `qa.silver_sectors_without_level`).
 
-### Planned redesign: fact + dimensions
+### `silver.dim_typesofbankruptcies`
 
-Split the single wide view into a star schema, and denormalise on purpose only in gold:
+One row per type. Source: `bronze.raw_typeofbankruptcy`. Columns: `type_key` (trimmed `key`), `type_title`, `type_description`.
 
-- **`silver` fact:** keys + measure + period fields only (`sector_code`, `bankruptcy_type_code`, `period_key`, `period_date`, status fields, `bankruptcies`).
-- **`silver` dimensions:** sector (with its **level** and parent section), type, and possibly period.
-- **`gold`:** joins fact and dimensions and filters to one level for each use.
+### Why fact + dimensions
 
-*Why:* the sector level is then stored once, in the sector dimension. Comparing levels becomes a different filter in gold, without touching the fact. QA checks also get clear targets (fact, dimension, and the link between them).
+The sector level is stored once, in the sector dimension. Comparing levels becomes a different filter in gold, without touching the fact. QA checks also get clear targets (fact, dimension, and the link between them). Gold joins fact and dimensions and filters to one level and one period type for each use.
 
-*Trade-off:* the inner joins in the current view also act as a silent validation (unknown keys drop out). After the split this has to be an explicit QA check: fact keys that are missing from the dimensions.
-
-Order of work:
-
-1. Sector dimension, with the root group → level mapping in `control` (which root groups contain sectors: checked, see *Sector hierarchy*).
-2. Type dimension; optionally a period dimension.
-3. Reduce `bankruptcies_monthly` to keys + measure + period/status fields.
-4. Point the QA views at the new fact and add the key-matching check.
-5. Gold: a model-ready view, joined and filtered to one level.
-
-After step 3, the row-count and duplicates checks should give the same results as before (237,708 rows, no duplicates).
+*Trade-off:* the inner joins in the earlier single view (`bankruptcies_monthly`) also acted as a silent validation (unknown keys dropped out). Now that has to be an explicit QA check: fact keys that are missing from the dimensions.
 
 ### Sector levels
 
@@ -173,13 +188,14 @@ After step 3, the row-count and duplicates checks should give the same results a
 - **Parent column (needed only for pooled models):** the nested category groups are empty, so the parent cannot come from `CategoryGroups`. Candidate sources: the SIC code at the start of the sector title (`011` → `01`), plus a small reference table for 2-digit branch → section (the official SBI 2008 ranges, e.g. 10–33 → C). Watch out: not every title starts with its code (*Other health care (no accommodation)* is 3-digit branch 869 but has no number).
 - **Use CBS's published figures for every level; do not aggregate them yourself.** CBS suppresses or rounds some detailed cells for confidentiality, so sums of 3-digit figures would not match the official higher-level figures.
 
-### Level mapping (planned)
+### Level mapping: `control.sector_levels`
 
 A small table in `control` maps each root category group to a readable level name. Values: root 0 → `sbi_0` (total), root 2 → `sbi_1`, root 5 → `sbi_2`, root 7 → `sbi_3`. Roots 9 and 30 hold no sectors and are not mapped.
 
 - **Maintained by hand, on purpose.** Which root counts as which level is an analysis decision, not something to calculate. Deriving the level from the group title (e.g. parsing "1st digit") would bring back the title dependency this design avoids.
-- **Kept in version control.** `CREATE TABLE` + `INSERT` live in a SQL file (planned: `sql/control/sector_levels.sql`) that is safe to run twice, so anyone can rebuild the table. Comparable to a dbt *seed*.
-- **The table holds only the mapping; it joins nothing.** The silver sector dimension does the joining: sector → its category group → root group (`parentid` if set, otherwise the group itself; cast `parentid` to integer) → **LEFT JOIN** the mapping on the root id.
+- **Kept in version control.** `CREATE TABLE IF NOT EXISTS` + `INSERT ... ON CONFLICT (root_group_id) DO UPDATE` live in `sql/control/sector_levels.sql`. The upsert makes the file safe to run twice: a changed title or level name in the file overwrites the row, so the file stays the single source of truth. Comparable to a dbt *seed*.
+- **An upsert never deletes.** A row removed from the file (or whose id changed) stays in the table until it is deleted by hand.
+- **The table holds only the mapping; it joins nothing.** The silver sector dimension does the joining: sector → its category group → root group (`parentid` if set, otherwise the group itself) → **LEFT JOIN** the mapping on the root id.
 - **Columns:** root group id (the key), level name, and the **expected root title** (e.g. *Branches 1st digit (SIC 2008)*). The title is not used for joining; it exists only for the sanity check below.
 
 #### Limitation: a hand-made mapping can go out of date
@@ -202,28 +218,36 @@ How likely this is: low. SIC 2008 is a fixed classification and CBS rarely renum
 
 Views in the `qa` schema check silver. Run them after every load and compare with the baseline.
 
-| View | Checks | Baseline (2026-11-10) |
+Updated 2026-11-13 for the fact/dimension split. The first four views read `silver.fact_bankruptcies`; `qa.silver_sectors_without_level` and `qa.silver_duplicate_dimensions` read the dimensions. The key-matching check (fact keys vs dimensions) is still planned.
+
+| View | Checks | Expected |
 |---|---|---|
-| `qa.silver_nulls` | null count per column (keys and measure), total rows, and the number of `bankruptcies = 0` | 0 nulls expected in all columns |
+| `qa.silver_nulls` | null count per column (keys and measure), total rows, and the number of `bankruptcies = 0` | 0 nulls in all columns |
 | `qa.silver_duplicates` | key combinations (type + sector + period) that occur more than once | no rows |
-| `qa.silver_row_counts` | bronze monthly rows vs silver rows | 237,708 = 237,708 |
+| `qa.silver_row_counts` | all bronze fact rows vs silver fact rows | bronze = silver (the count itself grows with every load; note it with a date when recording a baseline) |
+| `qa.impossible_values` | fact rows with a negative count | no rows |
+| `qa.silver_sectors_without_level` | sectors in `dim_sectors` that found no row in `control.sector_levels` (`level_group` empty) | no rows (confirmed 2026-11-13) |
+| `qa.silver_duplicate_dimensions` | keys that occur more than once in a dimension (`dim_sectors`, `dim_periods`, `dim_typesofbankruptcies`), with the dimension in column `list` | no rows (confirmed 2026-11-13) |
 
 Notes:
 
 - `bankruptcies_zeros` includes both real zeros and blanks that were loaded as 0 (see *Known issues*). It is the upper limit on how many values were really empty.
-- The row-count check repeats silver's filter on the bronze side (monthly periods only). If silver ever filters on purpose again, the bronze side must use the same filter.
+- The fact view is 1:1 with bronze (no filter, no join), so the row-count check cannot fail today. It is a guard: it starts to matter as soon as silver filters, deduplicates or joins.
 - Pattern for future checks: one view per check that **returns only the failing rows**; an empty result means the check passed. (`qa.silver_nulls` is a summary instead, which suits nulls.)
+- A check that asks one question of several dimensions is **one view**: one CTE per dimension with the same columns (`dimension_key`, `occurrences`, `list`), stacked with `UNION ALL`. `list` says which dimension a failing row comes from.
+- Duplicate checks count rows (`COUNT(*)`), not keys: `COUNT(column)` skips NULLs, so duplicate empty keys would be missed.
 
 ### Planned checks
 
 - **Gaps in the grid:** no missing periods, and the same number of sector/type combinations in every period.
 - **Codes that don't match:** fact keys that are missing from the dimensions (needed after the silver split).
-- **Values that can't be right:** negative counts, a malformed `period_key`, periods in the future.
+- **Values that can't be right:** negative counts are covered by `qa.impossible_values`; still to add: a malformed `period_key` and periods in the future (both are period checks, so they fit `dim_periods`).
+- **Unknown period types:** periods in `dim_periods` with an empty `period_date` (a period type other than `MM`, `KW`, `JJ`).
 - **Provisional vs final:** final figures never change between loads; provisional status only in the most recent periods.
 - **Totals vs parts, per level:** the sectors at one level add up to the total sector (allow for small CBS confidentiality differences).
 - **Freshness:** the latest period in silver is the latest one CBS has published.
 - **Sectors without a level:** sectors in the sector dimension whose root group is not in the level mapping. Should return no rows.
-- **Root title drift:** mapping rows whose stored root title differs from the current title in `dim_categorygroups`. Should return no rows; a hit means CBS reworded or renumbered a group.
+- **Root title drift:** mapping rows whose stored root title differs from the current title in `bronze.raw_categorygroups`. Should return no rows; a hit means CBS reworded or renumbered a group.
 
 ## Project structure
 
@@ -237,13 +261,21 @@ bankruptcies/
 │   ├── control/
 │   │   ├── load_time.sql          # control.load_runs (run log)
 │   │   ├── load_run_durations.sql # control.load_run_durations
-│   │   └── sector_levels.sql      # control.sector_levels (level mapping, in progress)
+│   │   └── sector_levels.sql      # control.sector_levels (level mapping)
 │   ├── silver/
-│   │   └── bankruptcies_monthly.sql
+│   │   ├── fact_bankruptcies.sql        # silver.fact_bankruptcies
+│   │   ├── dim_periods.sql              # silver.dim_periods
+│   │   ├── dim_sectors.sql              # silver.dim_sectors
+│   │   └── dim_typesofbankruptcies.sql  # silver.dim_typesofbankruptcies
+│   ├── gold/
+│   │   └── bankruptcies_monthly   # first draft, does not run yet
 │   └── qa/
-│       ├── nulls.sql          # qa.silver_nulls
-│       ├── duplicates.sql     # qa.silver_duplicates
-│       └── row_counts.sql     # qa.silver_row_counts
+│       ├── nulls.sql              # qa.silver_nulls
+│       ├── duplicates.sql         # qa.silver_duplicates
+│       ├── row_counts.sql         # qa.silver_row_counts
+│       ├── impossible_values.sql  # qa.impossible_values
+│       ├── sectors_without_level.sql  # qa.silver_sectors_without_level
+│       └── duplicate_dimensions.sql   # qa.silver_duplicate_dimensions
 ├── .env.example               # connection settings template
 ├── requirements.txt
 └── README.md
@@ -285,7 +317,13 @@ bankruptcies/
 
 4. **Create the control objects**: run the files in `sql/control/` (the run log table must exist before the first ingest).
 
-5. **Run the ingest**: `python scripts/ingest.py`. Then create the silver view(s) from `sql/silver/` and the QA views from `sql/qa/`.
+5. **Run the ingest**: `python scripts/ingest.py`.
+
+6. **Create the silver views** from `sql/silver/`. `control/sector_levels.sql` must have run first, because `dim_sectors` joins it. Then the QA views from `sql/qa/`.
+
+> **Changing a view's columns:** `CREATE OR REPLACE VIEW` can add columns at the end, but cannot remove or rename them (*"cannot drop columns from view"*). Drop the view first, then create it again.
+
+> **VS Code: run button does nothing?** `CREATE VIEW` returns no rows, so *No result found* in the results panel is normal; errors appear in the **Output** tab (channel *PostgreSQL*). If even a `SELECT` shows nothing, the extension has hung: reload the window (*Developer: Reload Window*) and check in DBeaver that earlier statements actually ran.
 
 > **Run the SQL against the `bankruptcies` database, not the default `postgres` database.** In the VS Code PostgreSQL extension the active database is shown above the editor and in the status bar; an editor connected to `postgres` creates schemas in the wrong place or fails with "relation does not exist".
 
@@ -301,7 +339,10 @@ bankruptcies/
 - [x] Move the ingest from the notebook to `scripts/ingest.py`
 - [x] Run log: `control.load_runs` (one row per run: start, stop, full/incremental, periods loaded, rows written) and the view `control.load_run_durations`, written by `ingest.py` in the same transaction as the facts
 - [x] Publish to public Git repository (pre-gold version)
-- [ ] Split silver into fact + dimensions, with the sector level in the sector dimension and the level mapping in `control`
+- [x] Split silver into fact + dimensions, with the sector level in the sector dimension and the level mapping in `control`
+- [x] Lookups keep integer types (`convert_dtypes`), so `parentid` is `bigint` instead of float
+- [x] Point the QA views at the new silver fact
+- [ ] QA: key-matching check (fact keys vs dimensions)
 - [ ] Remaining QA checks (see *Planned checks*)
 - [ ] Gold layer: model-ready view at one sector level (start: SIC sections)
 - [ ] Test the model at finer sector levels
@@ -319,10 +360,8 @@ bankruptcies/
 ## Known issues / to check
 
 - **Empty measure values are loaded as 0, not null.** Some CBS values are empty, but they arrive in Postgres as 0. This mixes "unknown / not published" with "zero bankruptcies", and it is a transformation in Python, against the design principles. To check: where the 0 comes from (`fillna`, `astype(int)` or the insert), and what CBS shows for those cells. Fix: drop the conversion, store the column as nullable in bronze, and decide in silver or gold how to treat nulls.
-- `bronze.dim_categorygroups.parentid` is stored as a float (`2.0`, `30.0`) because pandas turns an integer column with nulls into floats. Cast it to integer in silver (or load it as a nullable integer) before joining it to `id`.
+- `silver.fact_bankruptcies.bankruptcies` is not cast. Its type is whatever pandas chose for the bronze column. Cast it to integer in silver so gold and QA do not each have to.
 - **SIC unknown:** group 4 (*SIC unknown*) sits under the 1st-digit root, so it would count as part of the section level. Decide whether to keep it: useful for reconciling with the total, probably noise for the model.
-- `silver.bankruptcies_monthly` still joins `dim_categorygroups` without using it. The inner join can still drop sectors without a (matching) category group. It will be used for the level once the sector dimension exists.
-- `bankruptcy_type` comes from the bronze fact table, while `sector_description` comes from the lookup. Use the lookup for both (`dim_typeofbankruptcy.title`).
-- `qa.silver_nulls` was first written against `silver.raw_bankruptcies`. Make sure all QA views read the same silver object.
+- `sql/gold/bankruptcies_monthly` has no `.sql` extension, reads bronze directly and joins to `s` and `t`, which are never defined. Rebuild it on the silver fact and dimensions.
 - An early run created a stray `qa` schema in the default `postgres` database. Drop it there (connected to `postgres`, not `bankruptcies`).
 - In the notebook, the lookup-load cell uses `engine` before the *Connect to PostgreSQL* cell defines it. A clean run from top to bottom fails. (The notebook is now exploration only; the ingest runs from `scripts/ingest.py`.)

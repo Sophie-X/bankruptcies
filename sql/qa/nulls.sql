@@ -4,8 +4,8 @@ AS
 SELECT 
     COUNT(*)                                    AS total_row_count,
     COUNT(*) - COUNT(bankruptcies)              AS bankruptcies_nulls, 
-    COUNT(*) - COUNT(bankruptcy_type_code)      AS bankruptcy_type_code_nulls, 
-    COUNT(*) - COUNT(sector_code)               AS sector_code_nulls, 
-    COUNT(*) - COUNT(period_key)                AS period_key_nulls,
+    COUNT(*) - COUNT(type_key)                  AS type_nulls, 
+    COUNT(*) - COUNT(sector_key)                AS sector_nulls, 
+    COUNT(*) - COUNT(period_key)                AS period_nulls,
     COUNT(*) FILTER (where bankruptcies = 0)    AS bankruptcies_zeros
-from silver.bankruptcies_monthly;
+from silver.fact_bankruptcies;
