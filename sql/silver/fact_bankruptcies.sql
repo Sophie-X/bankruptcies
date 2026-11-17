@@ -5,4 +5,5 @@ SELECT
 	TRIM(sector_key) AS sector_key,
 	TRIM(type_key) AS type_key,
 	pronouncedbankruptcies_1 AS bankruptcies
-FROM bronze.raw_bankruptcies;
+FROM bronze.raw_bankruptcies
+WHERE pronouncedbankruptcies_1 >= 0;

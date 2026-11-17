@@ -1,33 +1,24 @@
-CREATE OR REPLACE VIEW gold.bankruptcies_monthly
+CREATE SCHEMA IF NOT EXISTS gold;
+CREATE OR REPLACE VIEW gold.bankruptcies_monthly_sbi_1
 AS 
-WITH 
-	lp AS (
-	    SELECT TRIM(period_key) AS period_key, status
-	    FROM control.load_periods
-	),
-	b AS (
-	    SELECT TRIM(period_key) AS period_key,
-	      TRIM(sector_key) AS sector_key,
-	      TRIM(type_key) AS type_key,
-	      right(left(trim(period_key), 6), 2)::text AS period_type,
-          typeofbankruptcy,
-	      pronouncedbankruptcies_1
-	    FROM bronze.raw_bankruptcies
-	)
 SELECT
-    t.key                                                                   AS bankruptcy_type_code,
-    s.key                                                                   AS sector_code,
+    b.type_key                                                              AS type_key,
+    t.type_title                                                            AS type_title,   
+    t.type_description                                                      AS type_description, 
+    b.sector_key                                                            AS sector_key,
+    s.sector_title                                                          AS sector_title,
+    s.level_name                                                            AS level_name,
     b.period_key                                                            AS period_key,
-    b.period_type                                                           AS period_type,
-    CASE
-        WHEN b.period_type = 'MM'        THEN make_date(left(b.period_key, 4)::int, right(b.period_key, 2)::int,1)
-        WHEN b.period_type = 'KW'        THEN make_date(left(b.period_key, 4)::int, (right(b.period_key, 2)::int * 3) - 2, 1)
-        WHEN b.period_type = 'JJ'        THEN make_date(left(b.period_key, 4)::int, 1, 1)
-        END                                                                 AS period_date,
-    lp.status                                                               AS period_status,
-    COALESCE(lp.status <> 'Definitief', true)                               AS is_provisional,
-    b.pronouncedbankruptcies_1::int                                         AS bankruptcies
-FROM b
-JOIN s ON s.key = b.sector_key
-JOIN t ON t.key = b.type_key
-LEFT JOIN lp ON lp.period_key = b.period_key;                  
+    p.period_type                                                           AS period_type,
+    p.period_date                                                           AS period_date,
+    p.period_status                                                         AS period_status,
+    p.is_provisional                                                        AS is_provisional,
+    b.bankruptcies                                                          AS bankruptcies
+FROM silver.fact_bankruptcies b
+INNER JOIN silver.dim_periods p
+ON b.period_key = p.period_key
+INNER JOIN silver.dim_typesofbankruptcies t
+ON t.type_key = b.type_key
+INNER JOIN silver.dim_sectors s
+ON s.sector_key = b.sector_key
+WHERE p.period_type = 'MM' AND s.level_name = 'sbi_1';

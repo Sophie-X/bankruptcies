@@ -4,7 +4,8 @@ WITH
 	p AS (
 	    SELECT 
             TRIM(key) AS period_key,
-            RIGHT(LEFT(TRIM(key), 6), 2)::text AS period_type
+            RIGHT(LEFT(TRIM(key), 6), 2)::text AS period_type,
+            title AS period_title
 	    FROM bronze.raw_periods
 	)
 SELECT
@@ -16,7 +17,8 @@ SELECT
         WHEN p.period_type = 'JJ'        THEN make_date(left(p.period_key, 4)::int, 1, 1)
         END                                                                 AS period_date,
     lp.status                                                               AS period_status,
-    COALESCE(lp.status <> 'Definitief', true)                               AS is_provisional
+    COALESCE(lp.status <> 'Definitief', true)                               AS is_provisional,
+    p.period_title AS period_title
 FROM p
 LEFT JOIN control.load_periods lp
 ON trim(lp.period_key) = p.period_key;
