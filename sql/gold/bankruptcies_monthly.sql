@@ -21,4 +21,4 @@ INNER JOIN silver.dim_typesofbankruptcies t
 ON t.type_key = b.type_key
 INNER JOIN silver.dim_sectors s
 ON s.sector_key = b.sector_key
-WHERE p.period_type = 'MM' AND s.level_name = 'sbi_1';
+WHERE p.period_type = 'MM' AND s.level_name = 'sbi_1' AND t.type_key <> 'A047596';
