@@ -2,7 +2,7 @@
 
 A small data pipeline for Dutch bankruptcy figures from CBS (Statistics Netherlands). It loads the data into PostgreSQL in medallion layers (bronze → silver → gold) and uses an **incremental load**: on each run it fetches only the periods that are new or can still change.
 
-> Status: work in progress. The scripted ingest (`scripts/ingest.py`) loads bronze incrementally and logs each run in `control.load_runs`. Since 2026-11-20 it loops over a list of CBS tables (`82244ENG` and the session-day-corrected `83085ENG`), with bronze names and control rows per table; silver, QA and gold still read the old single-table bronze names and have to be repointed (see *Known issues*). Silver is split into a fact and three dimensions, with the sector level mapping in `control`. The silver fact now drops impossible values. The first gold view, `gold.bankruptcies_monthly_sbi_1`, gives monthly bankruptcies per SIC section: the target for the model. QA now also checks that every fact key exists in its dimension (`qa.silver_orphaned_keys`) and whether the data is up to date (`qa.silver_freshness_check`). Two analysis views (schema `analysis`) answered the open data questions before modelling: where the zeros are, and which bankruptcy type is the total (see *Analysis findings*). The total check moved to QA (`qa.silver_total_type`), because gold relies on its answer. QA also checks that every monthly series is complete (`qa.silver_complete_grid`). The model question is defined and reviewed twice (see *Early warning model*): a warning per sector for the three months after the current one, built on bankruptcy history first and tested on held-out history from 2022 onward, plus an analysis phase with the original questions (changepoints, clustering, lead/lag). The second review (2026-11-19) tightened the evaluation: scores for the start of a rise, not only per window; no model choice made on data it is then scored on; tests that fit nested models and correlated sectors. Next: the steps in *Early warning model → Next steps*.
+> Status: work in progress. The scripted ingest (`scripts/ingest.py`) loads bronze incrementally and logs each run in `control.load_runs`. Since 2026-11-20 it loops over a list of CBS tables (`82244ENG` and the session-day-corrected `83085ENG`), with bronze names and control rows per table; silver and gold were repointed to the new bronze names on 2026-11-22 (checked on a fresh database: `gold.bankruptcies_monthly_sbi_1` returns 8,988 rows = 214 months × 21 sections × 2 types); QA still reads the old names. Silver is split into a fact and three dimensions, with the sector level mapping in `control`. The silver fact now drops impossible values. The first gold view, `gold.bankruptcies_monthly_sbi_1`, gives monthly bankruptcies per SIC section: the target for the model. QA now also checks that every fact key exists in its dimension (`qa.silver_orphaned_keys`) and whether the data is up to date (`qa.silver_freshness_check`). Two analysis views (schema `analysis`) answered the open data questions before modelling: where the zeros are, and which bankruptcy type is the total (see *Analysis findings*). The total check moved to QA (`qa.silver_total_type`), because gold relies on its answer. QA also checks that every monthly series is complete (`qa.silver_complete_grid`). The model question is defined and reviewed twice (see *Early warning model*): a warning per sector for the three months after the current one, built on bankruptcy history first and tested on held-out history from 2022 onward, plus an analysis phase with the original questions (changepoints, clustering, lead/lag). The second review (2026-11-19) tightened the evaluation: scores for the start of a rise, not only per window; no model choice made on data it is then scored on; tests that fit nested models and correlated sectors. Next: the steps in *Early warning model → Next steps*.
 
 ## Working with AI assistants
 
@@ -151,6 +151,17 @@ If any step in the transaction fails, neither the facts nor the control tables c
 
 First run on 2026-11-06: 301 periods new, 3 provisional, 301 of 301 loaded (335,916 rows).
 
+Rebuild on a fresh database (new computer, 2026-11-22), with two source tables:
+
+| Run | Table | Periods loaded | Rows written | Check |
+|---|---|---|---|---|
+| 1 (full) | `82244ENG` | 302 | 337,032 | +1 month since 2026-11-06: +1,116 rows = 372 sectors × 3 types |
+| 1 (full) | `83085ENG` | 778 | 3,112 | 778 periods × 4 types, no sector dimension |
+| 2 (incremental) | `82244ENG` | 3 | 3,348 | 3 provisional periods × 1,116 |
+| 2 (incremental) | `83085ENG` | 13 | 52 | 13 provisional periods × 4 types |
+
+The second run reloads only the provisional periods, so the incremental load works from an empty control table. `83085ENG` has more provisional periods than `82244ENG` (13 vs 3). Checked in `bronze.raw_83085eng_periods`: they are all of 2026 so far (`2026MM01`–`2026MM10` and `2026KW01`–`2026KW03`, status `Voorlopig`). CBS keeps this table provisional for the whole current year, while `82244ENG` only keeps its most recent periods provisional. The load handles both the same way: it follows the status CBS gives each period.
+
 ### Planned: schema-change guard
 
 Each fact table should keep at least the rows it had (for `82244ENG` at least 337,032 on 2026-11-20). With several tables the minimum has to be stored per table. If a download returns significantly fewer, CBS has probably changed the table structure. The run must then stop with a warning instead of loading. *(Described in the notebook, not implemented yet.)*
@@ -258,6 +269,23 @@ Without the title check, the last row would be a silent error. With it, every ca
 
 How likely this is: low. SIC 2008 is a fixed classification and CBS rarely renumbers within a table. The bigger risk is CBS publishing a **new table** with a newer SBI classification; that would change codes, sectors and groups at once, and the sector dimension would need rework with any approach.
 
+### Type mapping: `control.type_totals`
+
+Which bankruptcy type is the total, per source table. Added 2026-11-22, in `sql/control/type_totals.sql` (`CREATE TABLE IF NOT EXISTS` + `INSERT ... ON CONFLICT (type_key, table_loaded) DO UPDATE`, like `sector_levels`).
+
+| Column | Meaning |
+|---|---|
+| `type_key` | CBS type code |
+| `table_loaded` | source table, same values as in the other control tables (`82244ENG`, `83085ENG`) |
+| `is_total` | `boolean NOT NULL`: true for the total, false for a part |
+
+Primary key: (`type_key`, `table_loaded`). The parts share codes across tables (`A028820` and `A047597` are in both), while each table has its own total (`A047596` in `82244ENG`, `T001243` in `83085ENG`), so the code alone is not unique.
+
+- **Why a hand-made mapping.** CBS metadata has no field that marks the total: `CategoryGroupID` is empty for every type in both tables. Only the title says "Total", and the project does not match on titles. So the codes are written down once, here, and the views read the meaning instead of the code.
+- **Every type gets a row, true or false.** A type without a row is therefore unknown, not "a part". A new CBS type shows up as unmapped instead of being counted silently (see the planned QA check under *Next steps*).
+- **Rows written by hand, not generated** with `INSERT ... SELECT` from the bronze type tables. A generated insert would add every new CBS type automatically as `false`, which removes exactly that signal.
+- **Status:** `82244ENG` checked with data (`qa.silver_total_type`, 2026-11-18). `83085ENG` set from the title and description; the data check is the next step. Silver and gold do not read the table yet.
+
 ## QA layer
 
 Views in the `qa` schema check silver. Run them after every load and compare with the baseline.
@@ -361,7 +389,7 @@ Notes:
 - **The view name contains the level.** A finer level means a new view. Alternative for later: one view without the level filter, with `level_name` as a column, and the level chosen in Python as a parameter. Testing 2- and 3-digit levels then becomes a change of one argument.
 - **Includes *SIC unknown*.** Group 4 sits under the 1st-digit root, so the view returns 21 sectors (A–T + *Unknown*), not 20 (confirmed 2026-11-13). See *Known issues*.
 - **Keeps the two parts, drops the total (decided 2026-11-18).** `A047596` (*Total entities with/without legal pers.*) = `A047597` (*Companies and institutions*) + `A028820` (*Nat. person with sole proprietorship*) in every sector and month (confirmed 2026-11-18, see *Analysis findings*). Gold keeps the finest grain it can: the two parts stay as rows, and the total is derived by summing over `type_key`. Summing is now safe, because the total row is no longer in the view. The split by legal form stays available for the model without a second view.
-- **The total is excluded by its code (`'A047596'`).** This is a hardcoded value, against the *no hardcoded IDs* principle. To fix: let the type dimension say which type is the total (for example a flag on `dim_typesofbankruptcies`, or a small mapping in `control` like `sector_levels`), and filter gold on that. See *Known issues*.
+- **The total is excluded by its code (`'A047596'`).** *Update 2026-11-22: the mapping exists as `control.type_totals`; silver and gold do not use it yet (see* Next steps*).* This is a hardcoded value, against the *no hardcoded IDs* principle. To fix: let the type dimension say which type is the total (for example a flag on `dim_typesofbankruptcies`, or a small mapping in `control` like `sector_levels`), and filter gold on that. See *Known issues*.
 - `period_type` and `level_name` are constant in this view. They are kept so the view can later be stacked with other levels.
 
 ### Analysis findings (2026-11-18)
@@ -574,7 +602,13 @@ A short section on how others build and judge early warning systems, so the choi
 
 ### Next steps
 
-1. **Analysis: session days.** Do months with five Tuesdays have more bankruptcies, and how many more? Compare the Tuesday count (minus public holidays) with CBS's own correction factor: `83085NED` (corrected) against silver `sbi_0` (uncorrected). This needs a second CBS table in bronze; the ingest is built around one (`TABLE_ID`, and lookups land in `bronze.raw_<dimension>`, so a second table's `Periods` would overwrite `raw_periods`). Decided (2026-11-20): `83085ENG` (the English version, matching `82244ENG`) goes through the same `scripts/ingest.py`, with the same method: facts incremental, lookups reloaded in full, QA on both. The ingest stays in Python: `TABLE_ID` becomes a list `TABLE_IDS` at the top of the script and `main` loops over it; the functions take the table id as a parameter, and bronze table names are built from it (lowercase). Each table gets its own transaction and run log row; a failed table is logged and makes the run end with an error. Both control tables record the source table in `table_loaded`; in `control.load_periods` it is part of the primary key (`table_loaded`, `period_key`), because the same period has its own status and load time per table. **Done 2026-11-20:** the ingest loops over both tables (see *Load logic → Several source tables*); in the end both were added in one go instead of 82244 first. Behaviour differs from the plan on one point: a failing table stops the run and is not logged yet. **Still to do, in this order:** (a) fix the period join in `silver.dim_periods` (see *Known issues*, urgent); (b) point silver, QA and the freshness check at the new bronze names and filter the control tables on `table_loaded`; check that the 82244 figures come out unchanged (row counts, sum of the measure); (c) drop the old bronze tables; (d) build the 83085 silver views. For the comparison, the 83085 type matching `sbi_0` is not its total (`T001243` also includes natural persons without a sole proprietorship, `A041718`) but `A028820` + `A047597`, the same two parts gold uses. Before `83085ENG` is loaded, `silver.dim_periods` must stop joining all of `control.load_periods` on the period key alone, or every shared period appears twice.
+**Next up (set 2026-11-22), before the list below:**
+
+- **a. Check the `83085ENG` total with data.** For every period in `bronze.raw_83085eng_facts`, does `T001243` (*Total legal forms all nationalities*) equal the sum of the other three types (`A041718`, `A028820`, `A047597`)? Same logic as `qa.silver_total_type`, run once as a query. The mapping in `control.type_totals` marks `T001243` as the total on the strength of its title and description only; "all nationalities" could point to a part that is not in the table. No differences = the mapping is confirmed, as it is for `82244ENG`. Record the result here.
+- **b. Use the type mapping in silver and gold.** `silver.dim_typesofbankruptcies` gets `is_total` from `control.type_totals` (LEFT JOIN on the type code and `table_loaded`, so no type drops out of the dimension), and gold filters on it instead of `'A047596'`. Decide what an unmapped type (`is_total` NULL) does in gold: `NOT is_total` drops it silently. Done when gold still returns 8,988 rows and no type code is left in silver or gold.
+- **c. QA:** repoint the QA views to the new bronze names; generalise `qa.silver_total_type` to "total = sum of the non-total types, per source table", reading `control.type_totals`; add a check for types without a mapping (like `qa.silver_sectors_without_level`).
+
+1. **Analysis: session days.** Do months with five Tuesdays have more bankruptcies, and how many more? Compare the Tuesday count (minus public holidays) with CBS's own correction factor: `83085NED` (corrected) against silver `sbi_0` (uncorrected). This needs a second CBS table in bronze; the ingest is built around one (`TABLE_ID`, and lookups land in `bronze.raw_<dimension>`, so a second table's `Periods` would overwrite `raw_periods`). Decided (2026-11-20): `83085ENG` (the English version, matching `82244ENG`) goes through the same `scripts/ingest.py`, with the same method: facts incremental, lookups reloaded in full, QA on both. The ingest stays in Python: `TABLE_ID` becomes a list `TABLE_IDS` at the top of the script and `main` loops over it; the functions take the table id as a parameter, and bronze table names are built from it (lowercase). Each table gets its own transaction and run log row; a failed table is logged and makes the run end with an error. Both control tables record the source table in `table_loaded`; in `control.load_periods` it is part of the primary key (`table_loaded`, `period_key`), because the same period has its own status and load time per table. **Done 2026-11-20:** the ingest loops over both tables (see *Load logic → Several source tables*); in the end both were added in one go instead of 82244 first. Behaviour differs from the plan on one point: a failing table stops the run and is not logged yet. **Progress 2026-11-22:** (a) done, and (b) done for silver and gold; QA is still open. **Still to do, in this order:** (a) fix the period join in `silver.dim_periods` (see *Known issues*, urgent); (b) point silver, QA and the freshness check at the new bronze names and filter the control tables on `table_loaded`; check that the 82244 figures come out unchanged (row counts, sum of the measure); (c) drop the old bronze tables; (d) build the 83085 silver views. For the comparison, the 83085 type matching `sbi_0` is not its total (`T001243` also includes natural persons without a sole proprietorship, `A041718`) but `A028820` + `A047597`, the same two parts gold uses. Before `83085ENG` is loaded, `silver.dim_periods` must stop joining all of `control.load_periods` on the period key alone, or every shared period appears twice.
 2. **`dim_periods`: session days** (with the other derived date attributes in the backlog).
 3. **Analysis: seasonality,** on 2009–2021 only. After the session-day correction, is there still a month-of-year pattern?
 4. **Model settings in `control`:** see the list under *Design choices → Settings, not constants*.
@@ -600,7 +634,8 @@ bankruptcies/
 │   │   ├── load_periods.sql       # control.load_periods (status per source table and period at last load)
 │   │   ├── load_runs.sql          # control.load_runs (run log, one row per run per source table)
 │   │   ├── load_run_durations.sql # control.load_run_durations
-│   │   └── sector_levels.sql      # control.sector_levels (level mapping)
+│   │   ├── sector_levels.sql      # control.sector_levels (level mapping)
+│   │   └── type_totals.sql        # control.type_totals (which type is the total, per source table)
 │   ├── silver/
 │   │   ├── fact_bankruptcies.sql        # silver.fact_bankruptcies
 │   │   ├── dim_periods.sql              # silver.dim_periods
@@ -630,15 +665,20 @@ bankruptcies/
 
 ## Setup
 
+**Prerequisites:** Git, Python 3, PostgreSQL (on a Mac: [Postgres.app](https://postgresapp.com)), and optionally VS Code with the Python and PostgreSQL extensions. The VS Code extensions do not install Python or PostgreSQL; those are separate installs.
+
+0. **Clone the repo** to a folder that is **not** cloud-synced (iCloud Drive, OneDrive, Dropbox). Sync tools can duplicate or offload files inside `.git` and `.venv`. On a new computer, set `git config --global user.name` and `user.email` before the first commit.
+
 1. **Python environment**
    ```bash
-   python -m venv .venv
-   .venv\Scripts\activate        # Windows
+   python3 -m venv .venv          # Windows: python -m venv .venv
+   source .venv/bin/activate      # macOS/Linux
+   .venv\Scripts\activate         # Windows
    pip install -r requirements.txt
    ```
    Packages needed: `cbsodata`, `pandas`, `sqlalchemy`, `psycopg[binary]`, `python-dotenv`.
 
-2. **Connection settings**: copy `.env.example` to `.env` and fill in your values. `.env` is git-ignored.
+2. **Connection settings**: copy `.env.example` to `.env` and fill in your values. `.env` is git-ignored, so it does not come along with a clone: recreate it on every computer.
    ```
    PGHOST=localhost
    PGPORT=5432
@@ -646,14 +686,19 @@ bankruptcies/
    PGUSER=postgres
    PGPASSWORD=changeme
    ```
+   Postgres.app: the default user is your macOS user name, and local connections are trusted, so any password works (VS Code's connection form does not accept an empty one). The server must be running in Postgres.app; *Connection refused* on port 5432 means it is not.
 
-3. **Database**: create the database and the schemas:
+3. **Database**: create the database while connected to the default `postgres` database, then connect to `bankruptcies` and create the schemas:
    ```sql
+   CREATE DATABASE bankruptcies;   -- in the default postgres database
+
+   -- from here on: connected to bankruptcies
    CREATE SCHEMA IF NOT EXISTS control;
    CREATE SCHEMA IF NOT EXISTS bronze;
    CREATE SCHEMA IF NOT EXISTS silver;
    CREATE SCHEMA IF NOT EXISTS gold;
    CREATE SCHEMA IF NOT EXISTS qa;
+   CREATE SCHEMA IF NOT EXISTS analysis;
    ```
 
 4. **Create the control objects** from `sql/control/`, in this order (the ingest reads and writes the two tables, so they must exist before the first run, and the view needs its table):
@@ -661,10 +706,13 @@ bankruptcies/
    2. `load_runs.sql`: table `control.load_runs`, one row per run per source table
    3. `load_run_durations.sql`: view on `control.load_runs`
    4. `sector_levels.sql`: the sector-level mapping (needed by the silver views, not by the ingest)
+   5. `type_totals.sql`: which bankruptcy type is the total, per source table (needed by `silver.dim_typesofbankruptcies`, not by the ingest)
+
+   > **`CREATE TABLE IF NOT EXISTS` does not update an existing table.** If a control table already exists with an older definition (for example `load_periods` without `table_loaded`), running the file again does nothing, and the ingest fails with *column "table_loaded" does not exist*. Drop the old table (and the view that depends on it) and run the files again. While the tables are empty, nothing is lost.
 
 5. **Run the ingest**: `python scripts/ingest.py`.
 
-6. **Create the silver views** from `sql/silver/`. `control/sector_levels.sql` must have run first, because `dim_sectors` joins it. Then the QA views from `sql/qa/` and the gold views from `sql/gold/`.
+6. **Create the silver views** from `sql/silver/`. Silver reads `bronze.raw_82244eng_*` and joins `control.load_periods` on `table_loaded = '82244ENG'` as well as `period_key`: other source tables share the same period keys, so a join on `period_key` alone would return each period once per table. Gold reads only silver. **The QA views in `sql/qa/` still read the old bronze names** (roadmap: *Repoint silver, QA and gold*), so on a fresh database they fail until they are repointed. `control/sector_levels.sql` must have run first, because `dim_sectors` joins it. Then the QA views from `sql/qa/` and the gold views from `sql/gold/`.
 
 > **Changing a view's columns:** `CREATE OR REPLACE VIEW` can add columns at the end, but cannot remove or rename them (*"cannot drop columns from view"*). Drop the view first, then create it again.
 
@@ -707,9 +755,9 @@ bankruptcies/
 - [x] Commit the specification before running any model (2026-11-19)
 - [ ] Analysis: do five-Tuesday months have more bankruptcies? Check the Tuesday count against CBS's own correction (`83085NED` vs silver `sbi_0`). Is there seasonality after that correction (2009–2021 only)?
 - [x] Ingest: loop over a list of CBS tables (`TABLE_IDS`) in `scripts/ingest.py`, one transaction and run log row per table; add `83085ENG` (2026-11-20)
-- [ ] Repoint silver, QA and gold to the new bronze names (`raw_82244eng_*`), filter the control tables on `table_loaded`, drop the old bronze tables
+- [ ] Repoint silver, QA and gold to the new bronze names (`raw_82244eng_*`), filter the control tables on `table_loaded`, drop the old bronze tables (silver and gold done on 2026-11-22; QA still open)
 - [ ] Silver views for `83085ENG`
-- [ ] Type dimension: `is_total` flag from a hand-made mapping (like `control.sector_levels`), a QA check for unmapped types, and `qa.silver_total_type` generalised to total = sum of non-total types per source table
+- [ ] Type dimension: `is_total` flag from a hand-made mapping (like `control.sector_levels`), a QA check for unmapped types, and `qa.silver_total_type` generalised to total = sum of non-total types per source table (mapping table `control.type_totals` done on 2026-11-22; silver, gold and QA still to do)
 - [ ] `dim_periods`: derived date attributes, including court session days (see the backlog note)
 - [ ] Model settings in `control` (see *Design choices → Settings, not constants*)
 - [ ] Analysis: event share per level and sector on 2009–2021; freeze the thresholds; score the three baselines on development
@@ -752,7 +800,7 @@ bankruptcies/
 - **Empty measure values are loaded as 0, not null.** Some CBS values are empty, but they arrive in Postgres as 0. This mixes "unknown / not published" with "zero bankruptcies", and it is a transformation in Python, against the design principles. To check: where the 0 comes from (`fillna`, `astype(int)` or the insert), and what CBS shows for those cells. Fix: drop the conversion, store the column as nullable in bronze, and decide in silver or gold how to treat nulls.
 - `silver.fact_bankruptcies.bankruptcies` is not cast. Its type is whatever pandas chose for the bronze column. Cast it to integer in silver so gold and QA do not each have to.
 - **SIC unknown:** group 4 (*SIC unknown*) sits under the 1st-digit root, so it counts as part of the section level and is in `gold.bankruptcies_monthly_sbi_1` (21 sectors, confirmed 2026-11-13). Decided 2026-11-18: keep it, in gold and in the model (see *Analysis findings*).
-- **Gold excludes the total type by hardcoded code `'A047596'`.** Move the meaning into the type dimension or `control` (see the gold view notes). `qa.silver_total_type` hardcodes the same three codes; it should read the same flag or mapping once that exists.
-- `sql/gold/bankruptcies_monthly` has no `.sql` extension, and the file name differs from the view it creates (`gold.bankruptcies_monthly_sbi_1`).
+- **Gold excludes the total type by hardcoded code `'A047596'`.** The mapping table `control.type_totals` exists since 2026-11-22; until silver and gold read it, the code stays in gold. Move the meaning into the type dimension or `control` (see the gold view notes). `qa.silver_total_type` hardcodes the same three codes; it should read the same flag or mapping once that exists.
+- The gold file name (`sql/gold/bankruptcies_monthly.sql`) differs from the view it creates (`gold.bankruptcies_monthly_sbi_1`). The missing `.sql` extension is fixed.
 - An early run created a stray `qa` schema in the default `postgres` database. Drop it there (connected to `postgres`, not `bankruptcies`).
 - In the notebook, the lookup-load cell uses `engine` before the *Connect to PostgreSQL* cell defines it. A clean run from top to bottom fails. (The notebook is now exploration only; the ingest runs from `scripts/ingest.py`.)

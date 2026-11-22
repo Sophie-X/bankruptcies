@@ -4,4 +4,4 @@ SELECT
     TRIM(key)               AS type_key,
     title                   AS type_title, 
     description             AS type_description
-FROM bronze.raw_typeofbankruptcy;
+FROM bronze.raw_82244eng_typeofbankruptcy;

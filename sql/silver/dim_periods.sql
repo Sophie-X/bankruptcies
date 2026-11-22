@@ -6,7 +6,7 @@ WITH
             TRIM(key) AS period_key,
             RIGHT(LEFT(TRIM(key), 6), 2)::text AS period_type,
             title AS period_title
-	    FROM bronze.raw_periods
+	    FROM bronze.raw_82244eng_periods
 	)
 SELECT
     p.period_key,                                                              
@@ -21,4 +21,4 @@ SELECT
     p.period_title AS period_title
 FROM p
 LEFT JOIN control.load_periods lp
-ON trim(lp.period_key) = p.period_key;
+ON trim(lp.period_key) = p.period_key AND lp.table_loaded = '82244ENG';
