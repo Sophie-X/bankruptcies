@@ -2,7 +2,7 @@
 
 A small data pipeline for Dutch bankruptcy figures from CBS (Statistics Netherlands). It loads the data into PostgreSQL in medallion layers (bronze → silver → gold) and uses an **incremental load**: on each run it fetches only the periods that are new or can still change.
 
-> Status: work in progress. The scripted ingest (`scripts/ingest.py`) loads bronze incrementally and logs each run in `control.load_runs`. Silver is split into a fact and three dimensions, with the sector level mapping in `control`. The silver fact now drops impossible values. The first gold view, `gold.bankruptcies_monthly_sbi_1`, gives monthly bankruptcies per SIC section: the target for the model. QA now also checks that every fact key exists in its dimension (`qa.silver_orphaned_keys`) and whether the data is up to date (`qa.silver_freshness_check`). Two analysis views (schema `analysis`) answered the open data questions before modelling: where the zeros are, and which bankruptcy type is the total (see *Analysis findings*). The total check moved to QA (`qa.silver_total_type`), because gold relies on its answer. QA also checks that every monthly series is complete (`qa.silver_complete_grid`). The model question is defined and reviewed twice (see *Early warning model*): a warning per sector for the three months after the current one, built on bankruptcy history first and tested on held-out history from 2022 onward, plus an analysis phase with the original questions (changepoints, clustering, lead/lag). The second review (2026-11-19) tightened the evaluation: scores for the start of a rise, not only per window; no model choice made on data it is then scored on; tests that fit nested models and correlated sectors. Next: the steps in *Early warning model → Next steps*.
+> Status: work in progress. The scripted ingest (`scripts/ingest.py`) loads bronze incrementally and logs each run in `control.load_runs`. Since 2026-11-20 it loops over a list of CBS tables (`82244ENG` and the session-day-corrected `83085ENG`), with bronze names and control rows per table; silver, QA and gold still read the old single-table bronze names and have to be repointed (see *Known issues*). Silver is split into a fact and three dimensions, with the sector level mapping in `control`. The silver fact now drops impossible values. The first gold view, `gold.bankruptcies_monthly_sbi_1`, gives monthly bankruptcies per SIC section: the target for the model. QA now also checks that every fact key exists in its dimension (`qa.silver_orphaned_keys`) and whether the data is up to date (`qa.silver_freshness_check`). Two analysis views (schema `analysis`) answered the open data questions before modelling: where the zeros are, and which bankruptcy type is the total (see *Analysis findings*). The total check moved to QA (`qa.silver_total_type`), because gold relies on its answer. QA also checks that every monthly series is complete (`qa.silver_complete_grid`). The model question is defined and reviewed twice (see *Early warning model*): a warning per sector for the three months after the current one, built on bankruptcy history first and tested on held-out history from 2022 onward, plus an analysis phase with the original questions (changepoints, clustering, lead/lag). The second review (2026-11-19) tightened the evaluation: scores for the start of a rise, not only per window; no model choice made on data it is then scored on; tests that fit nested models and correlated sectors. Next: the steps in *Early warning model → Next steps*.
 
 ## Working with AI assistants
 
@@ -31,17 +31,21 @@ This is a learning project: I write the code myself.
 
 ## Data source
 
-| | |
-|---|---|
-| Provider | CBS StatLine (OData API, through the `cbsodata` package) |
-| Table | `82244ENG`: bankruptcies by type of bankruptcy, sector/branch (SIC 2008) and period |
-| Measure | `PronouncedBankruptcies_1`: number of pronounced bankruptcies |
-| Dimensions | `TypeOfBankruptcy` (3), `SectorBranchesSIC2008` (372), `Periods` (301: months, quarters, years from 2009), plus `CategoryGroups` (116) for the sector hierarchy |
-| Size | 335,916 fact rows (measured on 2026-11-06), of which 237,708 monthly |
+Provider: CBS StatLine (OData API, through the `cbsodata` package). The ingest loads every table in `TABLE_IDS` (top of `scripts/ingest.py`).
+
+| | `82244ENG` | `83085ENG` |
+|---|---|---|
+| Content | bankruptcies by type of bankruptcy, sector/branch (SIC 2008) and period | bankruptcies corrected for the number of court session days, national level only |
+| Role | the model target | the session-day analysis (*Next steps* 1) and, later, the national long history |
+| Measure | `PronouncedBankruptcies_1`: number of pronounced bankruptcies | `BankruptciesSessionDayCorrected_1` |
+| Dimensions | `TypeOfBankruptcy` (3), `SectorBranchesSIC2008` (372), `Periods` (302: months, quarters, years from 2009), plus `CategoryGroups` (116) for the sector hierarchy | `TypeOfBankruptcy` (4, a different list: it also covers natural persons), `Periods` (778, back to 1981). No sector dimension; `CategoryGroups` comes back empty |
+| Size | 337,032 fact rows (2026-11-20; 335,916 on 2026-11-06), of which 237,708 monthly on 2026-11-06 | 3,112 fact rows (2026-11-20) |
 
 Each period has a `Status` in the metadata: `Definitief` (final) or provisional. This status drives the incremental load.
 
-CBS publishes 17 periods per year: 12 months, 4 quarters and 1 year. That is why 237,708 of the 335,916 rows (≈ 12/17) are monthly.
+CBS publishes 17 periods per year: 12 months, 4 quarters and 1 year. That is why 237,708 of the 335,916 rows (≈ 12/17) of `82244ENG` were monthly on 2026-11-06.
+
+The sector hierarchy below applies to `82244ENG` only.
 
 ### Sector hierarchy (`CategoryGroups`)
 
@@ -67,17 +71,17 @@ No structural rule (such as "groups without a parent") picks out group 2 on its 
 ## Architecture
 
 ```
-CBS OData API (82244ENG)
-        │  Python: cbsodata + pandas + SQLAlchemy
+CBS OData API (TABLE_IDS: 82244ENG, 83085ENG)
+        │  Python: cbsodata + pandas + SQLAlchemy, one pass per table
         ▼
-┌───────────────┐   ┌──────────────────────────────┐
-│ control       │   │ bronze                       │
-│ load_periods  │   │ raw_bankruptcies  (facts)    │
-│ load_runs     │   │ raw_typeofbankruptcy         │
-│ sector_levels │   │ raw_sectorbranchessic2008    │
-└───────────────┘   │ raw_periods                  │
-                    │ raw_categorygroups           │
-                    └──────────────────────────────┘
+┌───────────────┐   ┌──────────────────────────────────────┐
+│ control       │   │ bronze  (per table id, e.g. 82244eng)│
+│ load_periods  │   │ raw_<id>_facts                       │
+│ load_runs     │   │ raw_<id>_typeofbankruptcy            │
+│ sector_levels │   │ raw_<id>_sectorbranchessic2008       │
+└───────────────┘   │ raw_<id>_periods                     │
+  (rows tagged      │ raw_<id>_categorygroups              │
+   table_loaded)    └──────────────────────────────────────┘
                                │  SQL
                                ▼
                     silver (views)                     ──►  qa.*  (checks)
@@ -96,7 +100,7 @@ CBS OData API (82244ENG)
 | Schema | Contents |
 |---|---|
 | `control` | Load bookkeeping (`load_periods`, `load_runs`, view `load_run_durations`) and analysis settings: the sector-level mapping `sector_levels` |
-| `bronze` | Raw data from CBS: table names `raw_<cbs name in lower case>`, column names lower-cased, column types picked by pandas (see *Lookups*) |
+| `bronze` | Raw data from CBS: facts in `raw_<table id>_facts`, lookups in `raw_<table id>_<cbs dimension name>` (all lower case, e.g. `raw_82244eng_periods`), column names lower-cased, column types picked by pandas (see *Lookups*). The table id is in the name because both tables have dimensions with the same name (`Periods`, `TypeOfBankruptcy`) |
 | `silver` | Cleaned, typed and conformed views (fact + dimensions), all sector levels and period types |
 | `gold` | Analysis-ready views, one sector level and one period type at a time |
 | `qa` | Data-quality checks on silver; reconciliation checks also read bronze |
@@ -104,9 +108,22 @@ CBS OData API (82244ENG)
 
 ## Load logic
 
+### Several source tables, one method
+
+`main` loops over `TABLE_IDS` and runs the same steps for each table: lookups, periods to load, download, restore codes, write. Every function takes the table id as a parameter, so nothing in the load is specific to one table. Adding a CBS table means adding its id to the list (and, if it has a new dimension, one line to `KEY_COLUMNS`).
+
+- **Per table:** its own bronze tables, its own rows in both control tables (column `table_loaded`), its own transaction and its own run log row with its own `started_at`.
+- **Nothing to load** for a table skips to the next one (`continue`), so a quiet table never stops the others.
+- **A table that fails** stops the run. Tables earlier in the list are already committed; the failing table's transaction rolls back completely. Running again is safe: finished tables load incrementally, the failed table picks up where it was. (A failed table is not logged yet: see *Roadmap → log failed runs*.)
+- **First run per table:** a table with no rows in `control.load_periods` gets a full download, even when another table is already loaded.
+
+Measured 2026-11-20: first run 337,032 rows for 302 periods (`82244ENG`) and 3,112 rows for 778 periods (`83085ENG`), both `full`; second run 3,348 rows for 3 periods and 52 rows for 13 periods, both `incremental`.
+
 ### Lookups: SCD Type 1
 
-The lookup tables (`bronze.raw_periods`, `raw_sectorbranchessic2008`, `raw_typeofbankruptcy`, `raw_categorygroups`) are reloaded in full on every run, without history.
+The lookup tables (`bronze.raw_<table id>_periods`, `_sectorbranchessic2008`, `_typeofbankruptcy`, `_categorygroups`) are reloaded in full on every run, without history.
+
+- **Which lookups:** every dimension and time dimension in the table's `DataProperties`, plus `CategoryGroups`. A lookup that comes back empty (as `CategoryGroups` does for `83085ENG`, which has no sectors) is skipped with a printed message instead of creating an empty table.
 
 - SIC 2008 is a fixed classification: a code always means the same sector. CBS only changes the wording of titles, and no analysis needs the old wording. Type 2 history would add complexity and no value.
 - **The assumption this rests on, and its risk.** The fact stores only codes, and final periods are never reloaded. If CBS ever reused a code for a different sector, period or type, every final period loaded under the old meaning would silently join to the new one, while new and provisional periods would be correct: one sector's history stitched onto another's. Within SBI 2008 this should not happen (CBS publishes a new table for a new classification rather than reusing codes; see *SBI 2025 transition* under *Known issues*). It is not prevented, only detected: see the *code meaning drift* check under *Planned checks*. If that check ever fires for real, SCD Type 2 (or a validity period on the dimension) becomes worth its complexity.
@@ -119,22 +136,24 @@ The lookup tables (`bronze.raw_periods`, `raw_sectorbranchessic2008`, `raw_typeo
 On each run:
 
 1. Get the current status of each period from the CBS `Periods` metadata.
-2. Compare it with `control.load_periods`, which holds the status each period had when it was last loaded.
+2. Compare it with `control.load_periods` (only the rows of this table: `WHERE table_loaded = :table_id`), which holds the status each period had when it was last loaded.
 3. Select a period for (re)load if one of these is true:
    - **New**: the period is not in the control table yet.
    - **Provisional**: its status at CBS is not `Definitief`.
    - **Status changed**: the status differs from the last load (for example provisional → `Definitief`).
 4. Download the selected periods. On the first run (empty control table), download the full table in one call, which is faster. On later runs, download in batches of 12 periods with an OData filter (`Periods eq '…' or …`).
-5. Restore the codes (`add_keys`): map each row's period, sector and type title to its key (`period_key`, `sector_key`, `type_key`) with the lookups from the same run. If any title cannot be mapped, the run stops with an error before anything is written.
-6. In **one transaction**: delete the selected periods from `bronze.raw_bankruptcies` and append the new rows. Then replace their entries in `control.load_periods`, with `loaded_at` set to the current UTC time.
+5. Restore the codes (`add_keys`): map each row's period, sector and type title to its key (`period_key`, `sector_key`, `type_key`) with the lookups from the same run. Which CBS dimension becomes which key column is set once in the constant `KEY_COLUMNS`; `add_keys` loops over it and skips the dimensions a table does not have (`83085ENG` has no sector). If any title cannot be mapped, the run stops with an error before anything is written. The missing-key check only looks at the key columns that were actually created.
+6. In **one transaction**: delete the selected periods from `bronze.raw_<table id>_facts` and append the new rows. Then replace this table's entries for those periods in `control.load_periods` (delete filtered on period **and** `table_loaded`), with `loaded_at` and `table_loaded` set, and write the run log row.
 
-If any step in the transaction fails, neither the facts nor the control table change. This keeps the two in sync.
+If any step in the transaction fails, neither the facts nor the control tables change. This keeps the two in sync.
+
+**Control tables, per source table.** `control.load_periods` has primary key (`table_loaded`, `period_key`), because the same period has its own status and load time in each table. `control.load_runs` has a `table_loaded` column too. When the ingest became multi-table (2026-11-20), `load_periods` was emptied so both tables got a fresh full load into their new bronze names; `load_runs` kept its history (old rows set to `82244ENG`).
 
 First run on 2026-11-06: 301 periods new, 3 provisional, 301 of 301 loaded (335,916 rows).
 
 ### Planned: schema-change guard
 
-The fact table should have at least 335,916 rows. If a download returns significantly fewer, CBS has probably changed the table structure. The run must then stop with a warning instead of loading. *(Described in the notebook, not implemented yet.)*
+Each fact table should keep at least the rows it had (for `82244ENG` at least 337,032 on 2026-11-20). With several tables the minimum has to be stored per table. If a download returns significantly fewer, CBS has probably changed the table structure. The run must then stop with a warning instead of loading. *(Described in the notebook, not implemented yet.)*
 
 ## Silver layer
 
@@ -555,19 +574,18 @@ A short section on how others build and judge early warning systems, so the choi
 
 ### Next steps
 
-1. **Commit this README** before running any model: the specification comes first.
-2. **Analysis: session days.** Do months with five Tuesdays have more bankruptcies, and how many more? Compare the Tuesday count (minus public holidays) with CBS's own correction factor: `83085NED` (corrected) against silver `sbi_0` (uncorrected).
-3. **`dim_periods`: session days** (with the other derived date attributes in the backlog).
-4. **Analysis: seasonality,** on 2009–2021 only. After the session-day correction, is there still a month-of-year pattern?
-5. **Model settings in `control`:** see the list under *Design choices → Settings, not constants*.
-6. **Analysis: event share and baselines.** With the draft thresholds, what share of sector windows in 2009–2021 is an event, per level and per sector? Adjust 1.25 and 3 until it is around 10–15%, then freeze them. Then score the three baselines on development: this sets the bar before any model is built.
-7. **Gold feature view (v1).** One row per sector × decision month. History as ratios to the normal, plus the parts of the offset (session days in the window, normal rate). Every column is known at the decision moment; the target window is the only column that looks forward, so checking for leakage means checking that no other column looks past *t*. Lags are built in SQL. A complete grid is guarded by `qa.silver_complete_grid`.
-8. **Model v1 in Python:** baselines first, then the count model and the logistic comparator, walk-forward over development, scored as in *Evaluation*.
-9. **Phase 1 in Python:** changepoints, break dates, clustering, lead/lag. The known-events check runs on all data; the selection of leading sectors runs inside the walk-forward.
-10. **v1b:** v1 + leading sectors; compare with v1.
-11. **v2:** load the indicator tables and the sector mapping in `control`; compare with the better of v1 and v1b.
-12. **Parent section, then finer levels.**
-13. **Optional: national long history** (the 2008 test).
+1. **Analysis: session days.** Do months with five Tuesdays have more bankruptcies, and how many more? Compare the Tuesday count (minus public holidays) with CBS's own correction factor: `83085NED` (corrected) against silver `sbi_0` (uncorrected). This needs a second CBS table in bronze; the ingest is built around one (`TABLE_ID`, and lookups land in `bronze.raw_<dimension>`, so a second table's `Periods` would overwrite `raw_periods`). Decided (2026-11-20): `83085ENG` (the English version, matching `82244ENG`) goes through the same `scripts/ingest.py`, with the same method: facts incremental, lookups reloaded in full, QA on both. The ingest stays in Python: `TABLE_ID` becomes a list `TABLE_IDS` at the top of the script and `main` loops over it; the functions take the table id as a parameter, and bronze table names are built from it (lowercase). Each table gets its own transaction and run log row; a failed table is logged and makes the run end with an error. Both control tables record the source table in `table_loaded`; in `control.load_periods` it is part of the primary key (`table_loaded`, `period_key`), because the same period has its own status and load time per table. **Done 2026-11-20:** the ingest loops over both tables (see *Load logic → Several source tables*); in the end both were added in one go instead of 82244 first. Behaviour differs from the plan on one point: a failing table stops the run and is not logged yet. **Still to do, in this order:** (a) fix the period join in `silver.dim_periods` (see *Known issues*, urgent); (b) point silver, QA and the freshness check at the new bronze names and filter the control tables on `table_loaded`; check that the 82244 figures come out unchanged (row counts, sum of the measure); (c) drop the old bronze tables; (d) build the 83085 silver views. For the comparison, the 83085 type matching `sbi_0` is not its total (`T001243` also includes natural persons without a sole proprietorship, `A041718`) but `A028820` + `A047597`, the same two parts gold uses. Before `83085ENG` is loaded, `silver.dim_periods` must stop joining all of `control.load_periods` on the period key alone, or every shared period appears twice.
+2. **`dim_periods`: session days** (with the other derived date attributes in the backlog).
+3. **Analysis: seasonality,** on 2009–2021 only. After the session-day correction, is there still a month-of-year pattern?
+4. **Model settings in `control`:** see the list under *Design choices → Settings, not constants*.
+5. **Analysis: event share and baselines.** With the draft thresholds, what share of sector windows in 2009–2021 is an event, per level and per sector? Adjust 1.25 and 3 until it is around 10–15%, then freeze them. Then score the three baselines on development: this sets the bar before any model is built.
+6. **Gold feature view (v1).** One row per sector × decision month. History as ratios to the normal, plus the parts of the offset (session days in the window, normal rate). Every column is known at the decision moment; the target window is the only column that looks forward, so checking for leakage means checking that no other column looks past *t*. Lags are built in SQL. A complete grid is guarded by `qa.silver_complete_grid`.
+7. **Model v1 in Python:** baselines first, then the count model and the logistic comparator, walk-forward over development, scored as in *Evaluation*.
+8. **Phase 1 in Python:** changepoints, break dates, clustering, lead/lag. The known-events check runs on all data; the selection of leading sectors runs inside the walk-forward.
+9. **v1b:** v1 + leading sectors; compare with v1.
+10. **v2:** load the indicator tables and the sector mapping in `control`; compare with the better of v1 and v1b.
+11. **Parent section, then finer levels.**
+12. **Optional: national long history** (the 2008 test).
 
 ## Project structure
 
@@ -579,7 +597,8 @@ bankruptcies/
 │   └── ingest.py              # scripted ingest: lookups + incremental fact load + run log
 ├── sql/
 │   ├── control/
-│   │   ├── load_time.sql          # control.load_runs (run log)
+│   │   ├── load_periods.sql       # control.load_periods (status per source table and period at last load)
+│   │   ├── load_runs.sql          # control.load_runs (run log, one row per run per source table)
 │   │   ├── load_run_durations.sql # control.load_run_durations
 │   │   └── sector_levels.sql      # control.sector_levels (level mapping)
 │   ├── silver/
@@ -628,22 +647,20 @@ bankruptcies/
    PGPASSWORD=changeme
    ```
 
-3. **Database**: create the database and the schemas. The ingest reads `control.load_periods` before it writes to it, so that table must exist before the first run:
+3. **Database**: create the database and the schemas:
    ```sql
    CREATE SCHEMA IF NOT EXISTS control;
    CREATE SCHEMA IF NOT EXISTS bronze;
    CREATE SCHEMA IF NOT EXISTS silver;
    CREATE SCHEMA IF NOT EXISTS gold;
    CREATE SCHEMA IF NOT EXISTS qa;
-
-   CREATE TABLE IF NOT EXISTS control.load_periods (
-       period_key text PRIMARY KEY,
-       status     text,
-       loaded_at  timestamptz
-   );
    ```
 
-4. **Create the control objects**: run the files in `sql/control/` (the run log table must exist before the first ingest).
+4. **Create the control objects** from `sql/control/`, in this order (the ingest reads and writes the two tables, so they must exist before the first run, and the view needs its table):
+   1. `load_periods.sql`: table `control.load_periods`, the status each period of each source table had when it was last loaded
+   2. `load_runs.sql`: table `control.load_runs`, one row per run per source table
+   3. `load_run_durations.sql`: view on `control.load_runs`
+   4. `sector_levels.sql`: the sector-level mapping (needed by the silver views, not by the ingest)
 
 5. **Run the ingest**: `python scripts/ingest.py`.
 
@@ -687,8 +704,12 @@ bankruptcies/
 - [x] Define the model question (2026-11-18, see *Early warning model*)
 - [x] Review the definition against the original intentions, an analyst's needs and academic standards (2026-11-18): test period moved to 2022, analysis phase restored, evaluation extended
 - [x] Second, independent review of the specification (2026-11-19): all points adopted (see *Early warning model → Review log*)
-- [ ] Commit the specification before running any model
+- [x] Commit the specification before running any model (2026-11-19)
 - [ ] Analysis: do five-Tuesday months have more bankruptcies? Check the Tuesday count against CBS's own correction (`83085NED` vs silver `sbi_0`). Is there seasonality after that correction (2009–2021 only)?
+- [x] Ingest: loop over a list of CBS tables (`TABLE_IDS`) in `scripts/ingest.py`, one transaction and run log row per table; add `83085ENG` (2026-11-20)
+- [ ] Repoint silver, QA and gold to the new bronze names (`raw_82244eng_*`), filter the control tables on `table_loaded`, drop the old bronze tables
+- [ ] Silver views for `83085ENG`
+- [ ] Type dimension: `is_total` flag from a hand-made mapping (like `control.sector_levels`), a QA check for unmapped types, and `qa.silver_total_type` generalised to total = sum of non-total types per source table
 - [ ] `dim_periods`: derived date attributes, including court session days (see the backlog note)
 - [ ] Model settings in `control` (see *Design choices → Settings, not constants*)
 - [ ] Analysis: event share per level and sector on 2009–2021; freeze the thresholds; score the three baselines on development
@@ -716,6 +737,7 @@ bankruptcies/
   - *Why:* the run row is now inserted at the end of a successful run, inside the facts transaction. A run that crashes rolls back and leaves no trace.
   - *How:* split the logging into `start_run()` (inserts a row with `status = 'running'` and returns the `run_id`, in its own transaction) and `finish_run(run_id, ...)` (updates that row with the stop time, counts and `status = 'success'`). A crashed run stays on `'running'`.
   - *Table changes:* add a `status` column (with a `CHECK` on the allowed values) and allow `stopped_at` to be null.
+  - *With several tables:* a failing table now also stops the tables after it in the list. Once failures are logged, the loop can catch the error per table, log it, carry on with the next table, and end the run with an error at the end.
 
 ## Known issues / to check
 

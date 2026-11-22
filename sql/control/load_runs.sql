@@ -4,5 +4,6 @@ CREATE TABLE IF NOT EXISTS control.load_runs (
     stopped_at timestamptz NOT NULL,
     run_type text NOT NULL CHECK (run_type IN ('full', 'incremental')),
     periods_loaded int NOT NULL DEFAULT 0,
-    rows_written int NOT NULL DEFAULT 0
+    rows_written int NOT NULL DEFAULT 0,
+    table_loaded text NOT NULL
 );
